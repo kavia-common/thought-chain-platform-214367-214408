@@ -1,0 +1,4 @@
+{
+    "command": "pytest",
+    "working_directory": "/home/kavia/workspace/code-generation/thought-chain-platform-214367-214408/thought_backend"
+}
