@@ -336,9 +336,23 @@ def create_thought(payload: ThoughtIn) -> ThoughtCreatedResponse:
     Errors:
         409 on duplicate per-token-per-UTC-day.
     """
-    username = payload.username.strip()
-    thought_text = payload.thought_text.strip()
-    anon_token = payload.token.strip()
+    # Extra guardrails to ensure clear messages even if upstream validation is bypassed
+    username = (payload.username or "").strip()
+    thought_text = (payload.thought_text or "").strip()
+    anon_token = (payload.token or "").strip()
+    if not username:
+        raise HTTPException(status_code=400, detail="Username cannot be empty.")
+    if len(username) > 50:
+        raise HTTPException(status_code=400, detail="Username must be at most 50 characters.")
+    if not thought_text:
+        raise HTTPException(status_code=400, detail="Thought text cannot be empty.")
+    if len(thought_text) > 500:
+        raise HTTPException(status_code=400, detail="Thought text must be at most 500 characters.")
+    if not anon_token:
+        raise HTTPException(status_code=400, detail="Token is required.")
+    if len(anon_token) < 8 or len(anon_token) > 200:
+        raise HTTPException(status_code=400, detail="Token length must be between 8 and 200 characters.")
+
     edit_token = secrets.token_urlsafe(16)
 
     conn = _get_db_connection()
@@ -358,6 +372,7 @@ def create_thought(payload: ThoughtIn) -> ThoughtCreatedResponse:
         )
         dup = duplicate_cur.fetchone()
         if dup:
+            # 409 Conflict with clear string detail
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="This token has already submitted a thought today (UTC). Try again tomorrow.",
@@ -446,6 +461,7 @@ def update_thought(
     """
     provided = (x_edit_token or token or "").strip()
     if not provided:
+        # 403 with clear message
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Missing edit token.")
 
     new_text = payload.thought_text.strip()
@@ -524,6 +540,7 @@ def delete_thought(
     """
     provided = (x_edit_token or token or "").strip()
     if not provided:
+        # 403 with clear message
         raise HTTPException(status_code=403, detail="Missing edit token.")
 
     conn = _get_db_connection()
