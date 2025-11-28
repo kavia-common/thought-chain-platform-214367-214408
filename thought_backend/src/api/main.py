@@ -27,6 +27,10 @@ app = FastAPI(
             "name": "Thoughts",
             "description": "Submit and fetch daily thoughts. One per user per UTC day.",
         },
+        {
+            "name": "Admin/Maintenance",
+            "description": "Development-only maintenance endpoints guarded by environment flags. Not for production use.",
+        },
     ],
 )
 
@@ -556,5 +560,61 @@ def delete_thought(
         conn.execute("DELETE FROM thoughts WHERE id = ?", (thought_id,))
         conn.commit()
         return
+    finally:
+        conn.close()
+
+
+@app.delete(
+    "/admin/dev/clear-thoughts",
+    status_code=status.HTTP_200_OK,
+    summary="DEV: Clear all thoughts (guarded by DEV_MAINTENANCE=1)",
+    description=(
+        "Development-only maintenance endpoint that removes all rows from the 'thoughts' table and its associated "
+        "'thought_token_guard' table. This endpoint is disabled unless the environment variable DEV_MAINTENANCE=1. "
+        "Intended strictly for local/dev workflows to reset state for demos or tests. Schema remains intact."
+    ),
+    tags=["Admin/Maintenance"],
+    responses={
+        200: {"description": "All thoughts cleared for development."},
+        403: {"description": "Maintenance endpoint disabled (DEV_MAINTENANCE not enabled)."},
+        500: {"description": "Server error."},
+    },
+)
+def dev_clear_all_thoughts() -> dict:
+    """
+    DEV-ONLY: Clear all stored thoughts and related token guard entries.
+
+    Behavior:
+    - Requires the environment variable DEV_MAINTENANCE=1; otherwise returns 403.
+    - Deletes from 'thoughts' (and companion 'thought_token_guard').
+    - Does not modify schema.
+    - Optionally compacts the database via VACUUM when using SQLite.
+
+    Returns:
+        JSON confirmation with counts of deleted rows when available.
+    """
+    if os.getenv("DEV_MAINTENANCE", "").strip() != "1":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Maintenance disabled")
+
+    conn = _get_db_connection()
+    try:
+        _ensure_schema(conn)
+
+        # Remove token guard rows first to avoid orphan references
+        guard_deleted = conn.execute("DELETE FROM thought_token_guard").rowcount
+
+        # Delete all thoughts
+        thoughts_deleted = conn.execute("DELETE FROM thoughts").rowcount
+
+        conn.commit()
+
+        # Optional compaction (SQLite NO-OP if not supported elsewhere)
+        try:
+            conn.execute("VACUUM")
+        except Exception:
+            # Ignore VACUUM failures on non-SQLite or connection modes that disallow it
+            pass
+
+        return {"status": "ok", "thoughts_deleted": thoughts_deleted, "token_guard_deleted": guard_deleted}
     finally:
         conn.close()
