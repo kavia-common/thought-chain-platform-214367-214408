@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import os
 import re
+import secrets
 import sqlite3
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, Header, Query, Path
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
@@ -16,7 +17,7 @@ app = FastAPI(
     description="API for submitting and retrieving daily thoughts. "
     "Each user can submit a single thought per UTC day. "
     "Thoughts are stored in SQLite and returned in chronological order.",
-    version="1.0.0",
+    version="1.1.0",
     openapi_tags=[
         {
             "name": "Health",
@@ -92,10 +93,17 @@ def _get_db_connection() -> sqlite3.Connection:
     return conn
 
 
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    """Check if a column exists on a table."""
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    cols = [r["name"] for r in cur.fetchall()]
+    return column in cols
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     """
     Ensure the 'thoughts' table exists with the required columns.
-    This is idempotent and safe to call at startup or per-request if needed.
+    Additive/idempotent: also ensure nullable edit_token and updated_at exist.
     """
     conn.execute(
         """
@@ -107,6 +115,11 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    # Idempotent ALTERs
+    if not _column_exists(conn, "thoughts", "edit_token"):
+        conn.execute("ALTER TABLE thoughts ADD COLUMN edit_token TEXT")
+    if not _column_exists(conn, "thoughts", "updated_at"):
+        conn.execute("ALTER TABLE thoughts ADD COLUMN updated_at DATETIME")
     conn.commit()
 
 
@@ -146,6 +159,29 @@ class ThoughtOut(BaseModel):
     username: str = Field(..., description="Username of the author.")
     thought_text: str = Field(..., description="Thought text.")
     created_at: str = Field(..., description="Creation timestamp in ISO 8601 UTC.")
+
+
+# PUBLIC_INTERFACE
+class ThoughtCreatedResponse(ThoughtOut):
+    """Extended create response including edit_token. Not used for listing."""
+    edit_token: str = Field(..., description="Secret token required to edit or delete this thought. Keep it safe.")
+
+
+# PUBLIC_INTERFACE
+class ThoughtPatchIn(BaseModel):
+    """Payload for updating an existing thought's text."""
+
+    thought_text: str = Field(..., description="The new textual content of the thought.", min_length=1, max_length=500)
+
+    @field_validator("thought_text")
+    @classmethod
+    def validate_thought_text(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Thought text cannot be empty.")
+        if len(v) > 500:
+            raise ValueError("Thought text must be at most 500 characters.")
+        return v
 
 
 def _row_to_thought_out(row: sqlite3.Row) -> ThoughtOut:
@@ -221,13 +257,14 @@ def list_thoughts() -> List[ThoughtOut]:
 
 @app.post(
     "/thoughts",
-    response_model=ThoughtOut,
+    response_model=ThoughtCreatedResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Create a new thought (one per user per UTC day)",
     description=(
         "Create a thought for a user. Inputs are trimmed and validated. "
         "Enforces one thought per user per UTC day using SQLite date('now'). "
-        "Returns 409 if the user already submitted a thought today."
+        "Returns 409 if the user already submitted a thought today. "
+        "Response includes an edit_token which is required to edit/delete the item."
     ),
     tags=["Thoughts"],
     responses={
@@ -237,7 +274,7 @@ def list_thoughts() -> List[ThoughtOut]:
         500: {"description": "Server error."},
     },
 )
-def create_thought(payload: ThoughtIn) -> ThoughtOut:
+def create_thought(payload: ThoughtIn) -> ThoughtCreatedResponse:
     """
     Create a new thought entry.
 
@@ -245,13 +282,14 @@ def create_thought(payload: ThoughtIn) -> ThoughtOut:
         payload (ThoughtIn): Contains `username` and `thought_text`. Both are trimmed and validated.
 
     Returns:
-        ThoughtOut: The created thought row.
+        ThoughtCreatedResponse: The created thought row with a secret edit_token.
 
     Errors:
         409 on duplicate per-user-per-UTC-day.
     """
     username = payload.username.strip()
     thought_text = payload.thought_text.strip()
+    edit_token = secrets.token_urlsafe(16)
 
     conn = _get_db_connection()
     try:
@@ -274,13 +312,13 @@ def create_thought(payload: ThoughtIn) -> ThoughtOut:
                 detail="User has already submitted a thought today (UTC).",
             )
 
-        # Insert
+        # Insert with token
         cur = conn.execute(
             """
-            INSERT INTO thoughts (username, thought_text)
-            VALUES (?, ?)
+            INSERT INTO thoughts (username, thought_text, edit_token)
+            VALUES (?, ?, ?)
             """,
-            (username, thought_text),
+            (username, thought_text, edit_token),
         )
         new_id = cur.lastrowid
         conn.commit()
@@ -298,6 +336,146 @@ def create_thought(payload: ThoughtIn) -> ThoughtOut:
         if not row:
             # Extremely unlikely; handle gracefully
             raise HTTPException(status_code=500, detail="Failed to retrieve created thought.")
-        return _row_to_thought_out(row)
+
+        base = _row_to_thought_out(row)
+        # Return extended response including token (not exposed in listing)
+        return ThoughtCreatedResponse(**base.model_dump(), edit_token=edit_token)
+    finally:
+        conn.close()
+
+
+@app.patch(
+    "/thoughts/{thought_id}",
+    response_model=ThoughtOut,
+    summary="Update a thought's text (token required)",
+    description=(
+        "Update the thought_text of a thought. Requires the correct edit token supplied either via "
+        "header 'X-Edit-Token' or query parameter 'token'. Trims and validates text. "
+        "Sets updated_at to CURRENT_TIMESTAMP on success."
+    ),
+    tags=["Thoughts"],
+    responses={
+        200: {"description": "Thought updated successfully."},
+        400: {"description": "Validation error."},
+        403: {"description": "Invalid or missing edit token."},
+        404: {"description": "Thought not found."},
+    },
+)
+def update_thought(
+    thought_id: int = Path(..., description="ID of the thought to update."),
+    payload: ThoughtPatchIn = ...,
+    x_edit_token: Optional[str] = Header(None, alias="X-Edit-Token"),
+    token: Optional[str] = Query(None, description="Edit token (alternative to header)."),
+) -> ThoughtOut:
+    """
+    Update an existing thought's text.
+
+    Parameters:
+        thought_id: The target thought ID.
+        payload: Contains the new thought_text.
+        x_edit_token: Optional token from header 'X-Edit-Token'.
+        token: Optional token from query param 'token'.
+
+    Returns:
+        ThoughtOut: The updated thought.
+
+    Errors:
+        403 if token is missing/invalid; 404 if id not found.
+    """
+    provided = (x_edit_token or token or "").strip()
+    if not provided:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Missing edit token.")
+
+    new_text = payload.thought_text.strip()
+    if not new_text or len(new_text) > 500:
+        raise HTTPException(status_code=400, detail="Invalid thought_text (1..500 chars required).")
+
+    conn = _get_db_connection()
+    try:
+        _ensure_schema(conn)
+
+        # Verify id exists and token matches
+        cur = conn.execute("SELECT id, edit_token FROM thoughts WHERE id = ?", (thought_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Thought not found.")
+        if row["edit_token"] != provided:
+            raise HTTPException(status_code=403, detail="Invalid edit token.")
+
+        # Perform update and set updated_at
+        conn.execute(
+            """
+            UPDATE thoughts
+            SET thought_text = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (new_text, thought_id),
+        )
+        conn.commit()
+
+        # Return updated record (without token)
+        fetch_cur = conn.execute(
+            "SELECT id, username, thought_text, created_at FROM thoughts WHERE id = ?",
+            (thought_id,),
+        )
+        row2 = fetch_cur.fetchone()
+        if not row2:
+            raise HTTPException(status_code=500, detail="Failed to load updated thought.")
+        return _row_to_thought_out(row2)
+    finally:
+        conn.close()
+
+
+@app.delete(
+    "/thoughts/{thought_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a thought (token required)",
+    description=(
+        "Delete a thought by ID. Requires the correct edit token supplied via header 'X-Edit-Token' "
+        "or query parameter 'token'. Returns 204 on success, 403 on invalid token, 404 if not found."
+    ),
+    tags=["Thoughts"],
+    responses={
+        204: {"description": "Thought deleted."},
+        403: {"description": "Invalid or missing edit token."},
+        404: {"description": "Thought not found."},
+    },
+)
+def delete_thought(
+    thought_id: int = Path(..., description="ID of the thought to delete."),
+    x_edit_token: Optional[str] = Header(None, alias="X-Edit-Token"),
+    token: Optional[str] = Query(None, description="Edit token (alternative to header)."),
+):
+    """
+    Delete the given thought.
+
+    Parameters:
+        thought_id: The target thought ID.
+        x_edit_token: Optional token from header 'X-Edit-Token'.
+        token: Optional token from query param 'token'.
+
+    Returns:
+        204 No Content on success.
+
+    Errors:
+        403 if token is missing/invalid; 404 if id not found.
+    """
+    provided = (x_edit_token or token or "").strip()
+    if not provided:
+        raise HTTPException(status_code=403, detail="Missing edit token.")
+
+    conn = _get_db_connection()
+    try:
+        _ensure_schema(conn)
+        cur = conn.execute("SELECT id, edit_token FROM thoughts WHERE id = ?", (thought_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Thought not found.")
+        if row["edit_token"] != provided:
+            raise HTTPException(status_code=403, detail="Invalid edit token.")
+
+        conn.execute("DELETE FROM thoughts WHERE id = ?", (thought_id,))
+        conn.commit()
+        return
     finally:
         conn.close()
