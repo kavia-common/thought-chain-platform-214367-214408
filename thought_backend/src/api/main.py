@@ -7,6 +7,17 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import List, Optional
 
+# Load environment variables early from a .env file if present
+try:
+    from dotenv import load_dotenv  # type: ignore
+    # Load .env from the backend container root if available; default to current working directory
+    # This allows DEV_MAINTENANCE and other vars to be recognized without manual export.
+    load_dotenv()
+except Exception:
+    # If python-dotenv is not installed or any error occurs, continue without failing.
+    # The app will still read from the actual environment via os.getenv.
+    pass
+
 from fastapi import FastAPI, HTTPException, status, Header, Query, Path
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
