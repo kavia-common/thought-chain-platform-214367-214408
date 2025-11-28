@@ -17,7 +17,7 @@ app = FastAPI(
     description="API for submitting and retrieving daily thoughts. "
     "Each user can submit a single thought per UTC day. "
     "Thoughts are stored in SQLite and returned in chronological order.",
-    version="1.1.0",
+    version="1.2.0",
     openapi_tags=[
         {
             "name": "Health",
@@ -100,10 +100,19 @@ def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
     return column in cols
 
 
+def _index_exists(conn: sqlite3.Connection, index_name: str) -> bool:
+    """Check if an index exists by name."""
+    cur = conn.execute("PRAGMA index_list(thoughts)")
+    indexes = [r["name"] if isinstance(r, sqlite3.Row) else r[1] for r in cur.fetchall()]
+    return index_name in indexes
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     """
     Ensure the 'thoughts' table exists with the required columns.
     Additive/idempotent: also ensure nullable edit_token and updated_at exist.
+    Additionally, add required token column and create an index guard that helps
+    enforce (token, date(created_at)) uniqueness at application level for SQLite.
     """
     conn.execute(
         """
@@ -120,6 +129,29 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE thoughts ADD COLUMN edit_token TEXT")
     if not _column_exists(conn, "thoughts", "updated_at"):
         conn.execute("ALTER TABLE thoughts ADD COLUMN updated_at DATETIME")
+    # Add anonymous token column (TEXT NOT NULL defaulting to empty then backfill not possible easily;
+    # keep as nullable but enforce NOT NULL at application layer for existing rows).
+    if not _column_exists(conn, "thoughts", "token"):
+        conn.execute("ALTER TABLE thoughts ADD COLUMN token TEXT")
+
+    # Create a helper computed day column if not present via companion table approach.
+    # Because SQLite doesn't support generated columns with date(created_at) reliably across versions here,
+    # we create a side table to guard uniqueness (token, day_key). It's additive and idempotent.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS thought_token_guard (
+            thought_id INTEGER UNIQUE,
+            token TEXT NOT NULL,
+            day_key TEXT NOT NULL,
+            UNIQUE(token, day_key)
+        )
+        """
+    )
+    # Indexes to speed up lookups (idempotent via IF NOT EXISTS not supported for index_list; check manually)
+    if not _index_exists(conn, "idx_thoughts_created_at"):
+        conn.execute("CREATE INDEX idx_thoughts_created_at ON thoughts (created_at)")
+    if not _index_exists(conn, "idx_thoughts_token"):
+        conn.execute("CREATE INDEX idx_thoughts_token ON thoughts (token)")
     conn.commit()
 
 
@@ -129,6 +161,7 @@ class ThoughtIn(BaseModel):
 
     username: str = Field(..., description="The username of the person submitting the thought.", min_length=1, max_length=50)
     thought_text: str = Field(..., description="The textual content of the user's thought.", min_length=1, max_length=500)
+    token: str = Field(..., description="Anonymous client token to enforce 1 submission per UTC day.", min_length=8, max_length=200)
 
     @field_validator("username")
     @classmethod
@@ -148,6 +181,16 @@ class ThoughtIn(BaseModel):
             raise ValueError("Thought text cannot be empty.")
         if len(v) > 500:
             raise ValueError("Thought text must be at most 500 characters.")
+        return v
+
+    @field_validator("token")
+    @classmethod
+    def validate_token(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Token is required.")
+        if len(v) < 8 or len(v) > 200:
+            raise ValueError("Token length must be between 8 and 200 characters.")
         return v
 
 
@@ -210,6 +253,12 @@ def _row_to_thought_out(row: sqlite3.Row) -> ThoughtOut:
     )
 
 
+def _day_key_utc_now() -> str:
+    """Return current UTC date key in YYYY-MM-DD using SQLite-compatible 'now' semantics replicated in app."""
+    # We base on UTC now to align with SQLite date('now')
+    return datetime.utcnow().strftime("%Y-%m-%d")
+
+
 @app.get(
     "/",
     summary="Health Check",
@@ -262,15 +311,15 @@ def list_thoughts() -> List[ThoughtOut]:
     summary="Create a new thought (one per user per UTC day)",
     description=(
         "Create a thought for a user. Inputs are trimmed and validated. "
-        "Enforces one thought per user per UTC day using SQLite date('now'). "
-        "Returns 409 if the user already submitted a thought today. "
+        "Enforces one thought per user per UTC day by anonymous token. "
+        "Returns 409 if the token already submitted a thought today. "
         "Response includes an edit_token which is required to edit/delete the item."
     ),
     tags=["Thoughts"],
     responses={
         201: {"description": "Thought created successfully."},
         400: {"description": "Validation error."},
-        409: {"description": "Duplicate submission for user in current UTC day."},
+        409: {"description": "Duplicate submission for token in current UTC day."},
         500: {"description": "Server error."},
     },
 )
@@ -279,48 +328,61 @@ def create_thought(payload: ThoughtIn) -> ThoughtCreatedResponse:
     Create a new thought entry.
 
     Parameters:
-        payload (ThoughtIn): Contains `username` and `thought_text`. Both are trimmed and validated.
+        payload (ThoughtIn): Contains `username`, `thought_text`, and `token`. All are trimmed and validated.
 
     Returns:
         ThoughtCreatedResponse: The created thought row with a secret edit_token.
 
     Errors:
-        409 on duplicate per-user-per-UTC-day.
+        409 on duplicate per-token-per-UTC-day.
     """
     username = payload.username.strip()
     thought_text = payload.thought_text.strip()
+    anon_token = payload.token.strip()
     edit_token = secrets.token_urlsafe(16)
 
     conn = _get_db_connection()
     try:
         _ensure_schema(conn)
 
-        # Duplicate check: one per user per UTC day using date('now') which is UTC in SQLite.
+        # Application-level duplicate check by token for the current UTC day using SQLite date('now')
         duplicate_cur = conn.execute(
             """
-            SELECT id FROM thoughts
-            WHERE username = ?
-              AND date(created_at) = date('now')
+            SELECT t.id
+            FROM thoughts t
+            WHERE t.token = ?
+              AND date(t.created_at) = date('now')
             LIMIT 1
             """,
-            (username,),
+            (anon_token,),
         )
         dup = duplicate_cur.fetchone()
         if dup:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="User has already submitted a thought today (UTC).",
+                detail="This token has already submitted a thought today (UTC). Try again tomorrow.",
             )
 
-        # Insert with token
+        # Insert primary row
         cur = conn.execute(
             """
-            INSERT INTO thoughts (username, thought_text, edit_token)
-            VALUES (?, ?, ?)
+            INSERT INTO thoughts (username, thought_text, edit_token, token)
+            VALUES (?, ?, ?, ?)
             """,
-            (username, thought_text, edit_token),
+            (username, thought_text, edit_token, anon_token),
         )
         new_id = cur.lastrowid
+
+        # Insert guard row to enforce uniqueness (token, day_key) at logical level
+        day_key = _day_key_utc_now()
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO thought_token_guard (thought_id, token, day_key)
+            VALUES (?, ?, ?)
+            """,
+            (new_id, anon_token, day_key),
+        )
+
         conn.commit()
 
         # Fetch the inserted row
